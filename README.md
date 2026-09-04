@@ -1,1 +1,1 @@
-普通用户请下载setup.exe
+普通用户请下载release里的etup.exe
