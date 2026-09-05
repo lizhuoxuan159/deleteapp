@@ -1,5 +1,7 @@
 ﻿# 下载
 普通用户请下载release里的`setup.exe`
+[点击下载 setup.exe](https://github.com/lizhuoxuan159/deleteapp/releases/download/1.0.1/setup.exe)
+[点击下载 delete.msi](https://github.com/lizhuoxuan159/deleteapp/releases/download/1.0.1/delete.msi)
 
 # 使用方法：
 cmd/powershell执行
