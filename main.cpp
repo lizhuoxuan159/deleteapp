@@ -4,147 +4,31 @@
 #include <queue>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 #pragma comment(lib, "rstrtmgr.lib")
 
 // ============================================================================
-//  Helper: Get current working directory
+//  Helper: Check if path is a system-protected directory
 // ============================================================================
-std::string GetCurrentDir() {
-    char buffer[MAX_PATH];
-    DWORD length = GetCurrentDirectoryA(MAX_PATH, buffer);
-    if (length == 0) {
-        std::cerr << "[Error] GetCurrentDirectory failed, error: " << GetLastError() << std::endl;
-        return "";
+bool IsProtectedSystemPath(const std::string& path) {
+    std::string lower = path;
+    for (auto& c : lower) c = tolower(c);
+    if (!lower.empty() && lower.back() == '\\') lower.pop_back();
+
+    static const std::vector<std::string> blocked = {
+        "c:\\windows", "c:\\windows\\system32", "c:\\windows\\syswow64",
+        "c:\\program files", "c:\\program files (x86)", "c:\\programdata",
+        "c:\\system volume information", "c:\\$recycle.bin"
+    };
+    for (const auto& bp : blocked) {
+        if (lower.find(bp) == 0) return true;
     }
-    return std::string(buffer, length);
+    return false;
 }
 
 // ============================================================================
-//  Check if current process is running as SYSTEM
-// ============================================================================
-bool IsSystemProcess() {
-    HANDLE hToken = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
-        return false;
-
-    DWORD size = 0;
-    GetTokenInformation(hToken, TokenUser, nullptr, 0, &size);
-    std::vector<BYTE> buffer(size);
-    if (!GetTokenInformation(hToken, TokenUser, buffer.data(), size, &size)) {
-        CloseHandle(hToken);
-        return false;
-    }
-
-    TOKEN_USER* pUser = reinterpret_cast<TOKEN_USER*>(buffer.data());
-    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
-    PSID systemSid = nullptr;
-    AllocateAndInitializeSid(&ntAuthority, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0, &systemSid);
-
-    bool isSystem = EqualSid(pUser->User.Sid, systemSid);
-    FreeSid(systemSid);
-    CloseHandle(hToken);
-    return isSystem;
-}
-
-// ============================================================================
-//  Enable SeDebugPrivilege (required to access SYSTEM processes)
-// ============================================================================
-bool EnableDebugPrivilege() {
-    HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
-        return false;
-
-    TOKEN_PRIVILEGES tp;
-    LUID luid;
-    if (!LookupPrivilegeValue(nullptr, SE_DEBUG_NAME, &luid)) {
-        CloseHandle(hToken);
-        return false;
-    }
-
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-    bool success = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
-    CloseHandle(hToken);
-    return success && GetLastError() != ERROR_NOT_ALL_ASSIGNED;
-}
-
-// ============================================================================
-//  Relaunch current executable as SYSTEM (with --elevated argument)
-// ============================================================================
-bool RunAsSystem() {
-    if (!EnableDebugPrivilege()) {
-        std::cerr << "[Error] Failed to enable SeDebugPrivilege. Run as Administrator." << std::endl;
-        return false;
-    }
-
-    // Open System process (PID 4)
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, 4);
-    if (!hProcess) {
-        std::cerr << "[Error] Cannot open System process (PID=4). Error: " << GetLastError() << std::endl;
-        return false;
-    }
-
-    HANDLE hToken = nullptr;
-    if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
-        CloseHandle(hProcess);
-        std::cerr << "[Error] OpenProcessToken failed. Error: " << GetLastError() << std::endl;
-        return false;
-    }
-
-    HANDLE hDuplicatedToken = nullptr;
-    if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &hDuplicatedToken)) {
-        CloseHandle(hToken);
-        CloseHandle(hProcess);
-        std::cerr << "[Error] DuplicateTokenEx failed. Error: " << GetLastError() << std::endl;
-        return false;
-    }
-
-    // Get current executable path
-    char exePath[MAX_PATH];
-    if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) {
-        std::cerr << "[Error] GetModuleFileName failed. Error: " << GetLastError() << std::endl;
-        CloseHandle(hDuplicatedToken);
-        CloseHandle(hToken);
-        CloseHandle(hProcess);
-        return false;
-    }
-
-    // Build command line: add --elevated
-    std::string cmdLine = std::string("\"") + exePath + "\" --elevated";
-
-    STARTUPINFOA si = { sizeof(si) };
-    PROCESS_INFORMATION pi;
-    if (!CreateProcessAsUserA(
-            hDuplicatedToken,
-            exePath,
-            cmdLine.data(),
-            nullptr, nullptr,
-            FALSE,
-            CREATE_NEW_CONSOLE,
-            nullptr, nullptr,
-            &si, &pi)) {
-        std::cerr << "[Error] CreateProcessAsUser failed. Error: " << GetLastError() << std::endl;
-        CloseHandle(hDuplicatedToken);
-        CloseHandle(hToken);
-        CloseHandle(hProcess);
-        return false;
-    }
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    CloseHandle(hDuplicatedToken);
-    CloseHandle(hToken);
-    CloseHandle(hProcess);
-
-    std::cout << "[Info] SYSTEM process launched successfully." << std::endl;
-    return true;
-}
-
-// ============================================================================
-//  The actual deletion logic (same as previous)
+//  Terminate processes using a file (Restart Manager)
 // ============================================================================
 int TerminateProcessesUsingFile(const std::wstring& filePath) {
     DWORD dwSession = 0;
@@ -184,8 +68,7 @@ int TerminateProcessesUsingFile(const std::wstring& filePath) {
     int terminated = 0;
     for (UINT i = 0; i < nProcInfo; ++i) {
         std::wcout << L"  PID: " << rgProcInfo[i].Process.dwProcessId
-                   << L" | App: " << rgProcInfo[i].strAppName
-                   << L" | Service: " << rgProcInfo[i].strServiceShortName << std::endl;
+                   << L" | App: " << rgProcInfo[i].strAppName << std::endl;
 
         HANDLE hProc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION, FALSE, rgProcInfo[i].Process.dwProcessId);
         if (hProc) {
@@ -198,9 +81,6 @@ int TerminateProcessesUsingFile(const std::wstring& filePath) {
                            << L" (error " << GetLastError() << L")" << std::endl;
             }
             CloseHandle(hProc);
-        } else {
-            std::wcerr << L"[Error] Failed to open process PID: " << rgProcInfo[i].Process.dwProcessId
-                       << L" (error " << GetLastError() << L")" << std::endl;
         }
     }
 
@@ -208,6 +88,9 @@ int TerminateProcessesUsingFile(const std::wstring& filePath) {
     return terminated;
 }
 
+// ============================================================================
+//  Delete a file with unlock attempt if locked
+// ============================================================================
 bool DeleteFileWithUnlock(const std::string& filePath) {
     if (DeleteFileA(filePath.c_str())) {
         std::cout << "[Deleted file] " << filePath << std::endl;
@@ -228,32 +111,42 @@ bool DeleteFileWithUnlock(const std::string& filePath) {
             if (DeleteFileA(filePath.c_str())) {
                 std::cout << "[Deleted file] " << filePath << " (after unlock)" << std::endl;
                 return true;
-            } else {
-                std::cerr << "[Error] Retry deletion still failed: " << filePath
-                          << " (error " << GetLastError() << ")" << std::endl;
             }
-        } else if (killed == 0) {
-            std::cerr << "[Warning] No locking process found, but deletion failed: " << filePath << std::endl;
-        } else {
-            std::cerr << "[Error] Unlock failed: " << filePath << std::endl;
         }
-    } else {
-        std::cerr << "[Error] Deletion failed: " << filePath << " (error " << err << ")" << std::endl;
     }
+    std::cerr << "[Error] Failed to delete: " << filePath << std::endl;
     return false;
 }
 
+// ============================================================================
+//  Structure for priority queue: (depth, path)
+// ============================================================================
+struct DirEntry {
+    int depth;
+    std::string path;
+
+    // Max-heap: deeper dirs pop first
+    bool operator<(const DirEntry& other) const {
+        return depth < other.depth;
+    }
+};
+
+// ============================================================================
+//  Delete directory tree using priority_queue (deepest first)
+// ============================================================================
 bool DeleteDirectoryTree(const std::string& root) {
-    std::queue<std::string> dirQueue;
-    std::queue<std::string> allDirs;
-    dirQueue.push(root);
-    allDirs.push(root);
+    std::queue<std::pair<std::string, int>> bfsQueue;  // (path, depth)
+    std::priority_queue<DirEntry> dirHeap;
+
+    bfsQueue.push({root, 0});
+    dirHeap.push({0, root});
 
     bool success = true;
 
-    while (!dirQueue.empty()) {
-        std::string currentDir = dirQueue.front();
-        dirQueue.pop();
+    // Phase 1: BFS traversal – delete files, collect dirs with depth
+    while (!bfsQueue.empty()) {
+        auto [currentDir, depth] = bfsQueue.front();
+        bfsQueue.pop();
 
         std::string searchPattern = currentDir;
         if (!searchPattern.empty() && searchPattern.back() != '\\')
@@ -275,8 +168,9 @@ bool DeleteDirectoryTree(const std::string& root) {
             fullPath += findData.cFileName;
 
             if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                dirQueue.push(fullPath);
-                allDirs.push(fullPath);
+                int childDepth = depth + 1;
+                bfsQueue.push({fullPath, childDepth});
+                dirHeap.push({childDepth, fullPath});
             } else {
                 if (!DeleteFileWithUnlock(fullPath))
                     success = false;
@@ -286,22 +180,21 @@ bool DeleteDirectoryTree(const std::string& root) {
         FindClose(hFind);
     }
 
-    std::vector<std::string> dirList;
-    while (!allDirs.empty()) {
-        dirList.push_back(allDirs.front());
-        allDirs.pop();
-    }
+    // Phase 2: Delete directories from deepest to shallowest
+    std::cout << "\n[Info] Deleting directories (deepest first)..." << std::endl;
+    while (!dirHeap.empty()) {
+        DirEntry entry = dirHeap.top();
+        dirHeap.pop();
 
-    for (auto it = dirList.rbegin(); it != dirList.rend(); ++it) {
-        if (!RemoveDirectoryA(it->c_str())) {
+        if (!RemoveDirectoryA(entry.path.c_str())) {
             DWORD err = GetLastError();
             if (err != ERROR_DIR_NOT_EMPTY) {
-                std::cerr << "[Error] Failed to remove directory: " << *it
-                          << " (error " << err << ")" << std::endl;
+                std::cerr << "[Error] Failed to remove directory (depth " << entry.depth
+                          << "): " << entry.path << " (error " << err << ")" << std::endl;
                 success = false;
             }
         } else {
-            std::cout << "[Deleted directory] " << *it << std::endl;
+            std::cout << "[Deleted directory] " << entry.path << " (depth " << entry.depth << ")" << std::endl;
         }
     }
 
@@ -309,62 +202,40 @@ bool DeleteDirectoryTree(const std::string& root) {
 }
 
 // ============================================================================
-//  Main entry point
+//  Main entry point – now uses command-line argument for target directory
 // ============================================================================
 int main(int argc, char* argv[]) {
-    // Check if we are running with the --elevated flag
-    bool isElevated = false;
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--elevated") == 0) {
-            isElevated = true;
-            break;
-        }
-    }
-
-    std::string root = GetCurrentDir();
-    if (root.empty()) {
-        std::cerr << "[Error] Cannot get current directory." << std::endl;
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <target_directory>" << std::endl;
+        std::cerr << "Example: " << argv[0] << " D:\\MyTestFolder" << std::endl;
         return 1;
     }
 
-    // If not elevated and not SYSTEM, ask user for consent
-    if (!isElevated && !IsSystemProcess()) {
-        std::cout << "==================================================" << std::endl;
-        std::cout << "Current process is NOT running as SYSTEM." << std::endl;
-        std::cout << "To delete protected files (like antivirus), we need SYSTEM privileges." << std::endl;
-        std::cout << "Do you agree to elevate to SYSTEM? (This will relaunch this program)" << std::endl;
-        std::cout << "Enter 'YES' to continue, anything else to cancel: ";
+    std::string root = argv[1];
 
-        std::string answer;
-        std::cin >> answer;
-        if (answer != "YES") {
-            std::cout << "Operation cancelled." << std::endl;
-            return 0;
-        }
-
-        std::cout << "Attempting to elevate to SYSTEM..." << std::endl;
-        if (!RunAsSystem()) {
-            std::cerr << "[Error] Elevation failed. Please run as Administrator and try again." << std::endl;
-            return 1;
-        }
-
-        std::cout << "Elevation successful. The new SYSTEM process is running." << std::endl;
-        std::cout << "This process will now exit." << std::endl;
-        return 0;
+    // Check if directory exists
+    DWORD attr = GetFileAttributesA(root.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        std::cerr << "Error: Directory does not exist." << std::endl;
+        return 1;
+    }
+    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        std::cerr << "Error: Path is not a directory." << std::endl;
+        return 1;
     }
 
-    // Now we are either SYSTEM or elevated by flag
-    if (IsSystemProcess())
-        std::cout << "[Info] Running with SYSTEM privileges." << std::endl;
-    else
-        std::cout << "[Info] Running with Administrator privileges (--elevated flag)." << std::endl;
+    // Protect system directories
+    if (IsProtectedSystemPath(root)) {
+        std::cerr << "Access Denied" << std::endl;
+        return 1;
+    }
 
-    // Confirm deletion again (extra safety)
     std::cout << "==================================================" << std::endl;
     std::cout << "This program will delete ALL contents and subdirectories" << std::endl;
-    std::cout << "under the current directory:" << std::endl;
+    std::cout << "under the specified directory:" << std::endl;
     std::cout << "  " << root << std::endl;
     std::cout << "WARNING: This operation is IRREVERSIBLE!" << std::endl;
+    std::cout << "==================================================" << std::endl;
     std::cout << "Enter 'YES' to continue: ";
 
     std::string confirm;
