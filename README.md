@@ -1,8 +1,11 @@
-#下载
-普通用户请下载release里的setup.exe
+﻿# 下载
+普通用户请下载release里的`setup.exe`
 
-#使用方法：
-cmd/powershell执行deleteapp.exe <文件路径>
+# 使用方法：
+cmd/powershell执行
+```cmd
+deleteapp.exe `[文件路径]`
+```
 
-#危险警告：
-请勿对C:/Windows及其子文件夹执行
+# ⚠️危险警告：
+请勿对`C:\Windows`及其子文件夹执行！！！
